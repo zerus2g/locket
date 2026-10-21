@@ -471,6 +471,13 @@
                 full_name: "oanh_oanh03",
                 avatar: "https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F5MDwHXPw0FSnIZf68mtFSKYtZEK2%2Fpublic%2Fprofile_pic.webp?alt=media&token=6cd3d239-eaf3-445f-b14d-a9cd0c87cbb7",
                 token: "a621c6d7cbc1"
+            },
+            "dangtramy2006": {
+                uid: "s7nbs4TbL8NyhUzHwGjpRr9gt1I2",
+                username: "dangtramy2006",
+                full_name: "dangtramy2006",
+                avatar: "https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2Fs7nbs4TbL8NyhUzHwGjpRr9gt1I2%2Fpublic%2Fprofile_pic.webp?alt=media&token=2d2e42e7-be2d-49f8-8bd3-c99b6064a7f7",
+                token: "d59044be1503"
             }
         };
 
@@ -1291,6 +1298,16 @@
             }
         }
 
+        async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+            const ctrl = new AbortController();
+            const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+            try {
+                return await fetch(url, { ...options, signal: ctrl.signal });
+            } finally {
+                clearTimeout(tid);
+            }
+        }
+
         async function resolveLocketClientSide(rawVal) {
             let clean = rawVal.trim().replace(/^@/, '');
             if (clean.includes('locket.cam/')) {
@@ -1310,6 +1327,19 @@
                     is_cloud: true
                 };
             }
+            if (/^[A-Za-z0-9]{28}$/.test(clean)) {
+                const tok = clean.slice(0, 12).toLowerCase();
+                return {
+                    ok: true,
+                    uid: clean,
+                    username: clean.slice(0, 10),
+                    full_name: clean.slice(0, 10),
+                    avatar: `https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F${clean}%2Fpublic%2Fprofile_pic.webp?alt=media`,
+                    token: tok,
+                    dns: { relative_url: buildMobileconfigDataUri(clean.slice(0, 10), tok) },
+                    is_cloud: true
+                };
+            }
             if (locketSession && locketSession.uid && (clean.toLowerCase() === (locketSession.username || '').toLowerCase() || clean === locketSession.uid)) {
                 const tok = locketSession.uid.slice(0, 12).toLowerCase();
                 return {
@@ -1323,23 +1353,47 @@
                     is_cloud: true
                 };
             }
-            // Scrape locket.cam via public CORS proxies
-            const targetUrl = `https://locket.cam/${encodeURIComponent(clean)}`;
-            const proxies = [
-                `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
-                `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`
-            ];
-            for (const pUrl of proxies) {
+
+            // 1. Try active tunnel API if online (with fast 3s timeout)
+            if (cloudStatus.cf_url) {
                 try {
-                    const r = await fetch(pUrl);
+                    const r = await fetchWithTimeout(`${cloudStatus.cf_url.replace(/\/$/, '')}/api/dns/generate`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: rawVal })
+                    }, 3500);
+                    if (r.ok) {
+                        const d = await r.json();
+                        if (d && d.ok && d.uid) {
+                            d.dns = { relative_url: buildMobileconfigDataUri(d.username, d.token) };
+                            d.is_cloud = true;
+                            KNOWN_USERS_DB[(d.username || clean).toLowerCase()] = d;
+                            return d;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // 2. Serverless 24/7 Cloud Scrape via r.jina.ai (returns in ~400ms with CORS *)
+            const targetUrl = `https://locket.cam/${encodeURIComponent(clean)}`;
+            const endpoints = [
+                `https://r.jina.ai/${targetUrl}`,
+                `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`
+            ];
+            for (const pUrl of endpoints) {
+                try {
+                    const r = await fetchWithTimeout(pUrl, {}, 5000);
                     if (!r.ok) continue;
-                    const htmlTxt = await r.text();
-                    const unq = decodeURIComponent(htmlTxt);
-                    const mUid = unq.match(/\/([A-Za-z0-9]{28})[0-9a-f]{16}/);
-                    if (mUid) {
-                        const uid = mUid[1];
+                    const rawTxt = await r.text();
+                    const mUser = rawTxt.match(/users(?:%2F|\/)([A-Za-z0-9]{28})(?:%2F|\/)/i)
+                        || rawTxt.match(/(?:%2F|\/)([A-Za-z0-9]{28})[0-9a-f]{16}/i);
+                    if (mUser) {
+                        const uid = mUser[1];
                         const tok = uid.slice(0, 12).toLowerCase();
-                        const avatar = `https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F${uid}%2Fpublic%2Fprofile_pic.webp?alt=media`;
+                        const mImg = rawTxt.match(/(https:\/\/cdn2\.locketcamera\.com\/v0\/b\/locket-img\/o\/users[^\s)"'<>\\]+)/);
+                        const avatar = mImg
+                            ? mImg[1]
+                            : `https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F${uid}%2Fpublic%2Fprofile_pic.webp?alt=media`;
                         const entry = {
                             ok: true,
                             uid,
@@ -1355,7 +1409,7 @@
                     }
                 } catch (e) {}
             }
-            return { ok: false, error: `Không tìm thấy UID cho '${rawVal}'. Hãy dán đúng link locket.cam/... hoặc đăng nhập ở mục dưới!` };
+            return { ok: false, error: `Không tìm thấy UID cho '${rawVal}'. Hãy kiểm tra lại đúng username Locket!` };
         }
 
         async function generateDnsForUser() {
@@ -1379,14 +1433,16 @@
 
             try {
                 let data = null;
-                try {
-                    const res = await fetch('/api/dns/generate', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: urlVal })
-                    });
-                    if (res.ok) data = await res.json();
-                } catch (e) {}
+                if (!window.location.hostname.includes('github.io')) {
+                    try {
+                        const res = await fetchWithTimeout('/api/dns/generate', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ url: urlVal })
+                        }, 3000);
+                        if (res.ok) data = await res.json();
+                    } catch (e) {}
+                }
 
                 if (!data || !data.ok) {
                     data = await resolveLocketClientSide(urlVal);
