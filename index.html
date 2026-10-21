@@ -255,9 +255,16 @@
                                     Caption
                                 </div>
                             </div>
+
+                            <!-- Preview Mute/Unmute Toggle Button -->
+                            <button type="button" id="btnTogglePreviewMute" onclick="event.stopPropagation(); togglePreviewVideoAudio()"
+                                    class="hidden absolute top-3 right-3 px-2.5 py-1.5 rounded-full bg-black/70 hover:bg-black/90 border border-white/20 text-white text-[11px] font-bold shadow-lg backdrop-blur-md z-20 cursor-pointer">
+                                🔇 Bấm bật tiếng
+                            </button>
                         </div>
 
-                        <div id="mediaInfoBadge" class="hidden mt-3 px-3.5 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-bold"></div>
+                        <div id="mediaInfoBadge" class="hidden mt-3 px-3.5 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-bold text-center"></div>
+                        <div id="audioStatusBadge" class="hidden mt-1.5 px-3.5 py-1.5 rounded-xl bg-amber-500/15 border border-amber-400/30 text-amber-200 text-[11px] font-semibold text-center"></div>
                     </div>
 
                     <!-- Right: Controls & Upload Button -->
@@ -900,7 +907,406 @@
             wrap.classList.remove('hidden');
         }
 
-        function handleMomentFileSelected(ev) {
+        function togglePreviewVideoAudio() {
+            const vidEl = document.getElementById('momentPreviewVideo');
+            const btn = document.getElementById('btnTogglePreviewMute');
+            if (!vidEl) return;
+            vidEl.muted = !vidEl.muted;
+            if (!vidEl.muted) {
+                vidEl.volume = 1.0;
+                vidEl.play().catch(() => {});
+            }
+            if (btn) {
+                btn.textContent = vidEl.muted ? '🔇 Bấm bật tiếng' : '🔊 Đang bật tiếng';
+            }
+        }
+
+        function readAscii4(u8, off) {
+            return String.fromCharCode(u8[off], u8[off + 1], u8[off + 2], u8[off + 3]);
+        }
+
+        function readU32BE(u8, off) {
+            return ((u8[off] << 24) | (u8[off + 1] << 16) | (u8[off + 2] << 8) | u8[off + 3]) >>> 0;
+        }
+
+        function writeU32BE(u8, off, val) {
+            u8[off] = (val >>> 24) & 0xff;
+            u8[off + 1] = (val >>> 16) & 0xff;
+            u8[off + 2] = (val >>> 8) & 0xff;
+            u8[off + 3] = val & 0xff;
+        }
+
+        function parseSubBoxesJS(u8, start = 0, end = u8.byteLength) {
+            const out = [];
+            let pos = start;
+            while (pos + 8 <= end) {
+                let sz = readU32BE(u8, pos);
+                const type = readAscii4(u8, pos + 4);
+                let hdr = 8;
+                if (sz === 1) {
+                    if (pos + 16 > end) break;
+                    const hi = readU32BE(u8, pos + 8);
+                    const lo = readU32BE(u8, pos + 12);
+                    sz = hi * 4294967296 + lo;
+                    hdr = 16;
+                } else if (sz === 0) {
+                    sz = end - pos;
+                }
+                if (sz < hdr || pos + sz > end) break;
+                out.push({ type, start: pos, payloadStart: pos + hdr, end: pos + sz, size: sz });
+                pos += sz;
+            }
+            return out;
+        }
+
+        function concatUint8Arrays(arrays) {
+            let total = 0;
+            for (const a of arrays) total += a.byteLength;
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const a of arrays) {
+                out.set(a, off);
+                off += a.byteLength;
+            }
+            return out;
+        }
+
+        function makeMp4BoxJS(typeStr, payloadU8) {
+            const out = new Uint8Array(8 + payloadU8.byteLength);
+            writeU32BE(out, 0, out.byteLength);
+            for (let i = 0; i < 4; i++) out[4 + i] = typeStr.charCodeAt(i);
+            out.set(payloadU8, 8);
+            return out;
+        }
+
+        function findEsdsBoxJS(u8) {
+            for (let i = 4; i + 8 <= u8.byteLength; i++) {
+                if (u8[i] === 0x65 && u8[i + 1] === 0x73 && u8[i + 2] === 0x64 && u8[i + 3] === 0x73) { // 'esds'
+                    const sz = readU32BE(u8, i - 4);
+                    if (sz >= 12 && (i - 4 + sz) <= u8.byteLength) {
+                        return u8.subarray(i - 4, i - 4 + sz);
+                    }
+                }
+            }
+            return null;
+        }
+
+        async function remuxVideoForLocketAudioJS(file) {
+            try {
+                // 1. Zero-copy scan top-level atoms
+                const topBoxes = [];
+                let pos = 0;
+                const total = file.size;
+                let ftypBrand = '';
+                while (pos + 8 <= total) {
+                    const hdrBuf = await file.slice(pos, Math.min(pos + 32, total)).arrayBuffer();
+                    const u8 = new Uint8Array(hdrBuf);
+                    let sz = readU32BE(u8, 0);
+                    const type = readAscii4(u8, 4);
+                    let hdr = 8;
+                    if (sz === 1) {
+                        if (u8.byteLength < 16) break;
+                        sz = readU32BE(u8, 8) * 4294967296 + readU32BE(u8, 12);
+                        hdr = 16;
+                    } else if (sz === 0) {
+                        sz = total - pos;
+                    }
+                    if (type === 'ftyp' && u8.byteLength >= 12) {
+                        ftypBrand = readAscii4(u8, 8);
+                    }
+                    if (sz < hdr || pos + sz > total) break;
+                    topBoxes.push({ type, offset: pos, hdrSize: hdr, size: sz, end: pos + sz });
+                    pos += sz;
+                }
+
+                const moovBox = topBoxes.find(b => b.type === 'moov');
+                const mdatBoxes = topBoxes.filter(b => b.type === 'mdat');
+                if (!moovBox || mdatBoxes.length === 0) {
+                    const isMov = ftypBrand === 'qt  ' || /\.mov$/i.test(file.name);
+                    return {
+                        blob: file,
+                        ext: isMov ? 'mov' : 'mp4',
+                        contentType: isMov ? 'video/quicktime' : 'video/mp4',
+                        hasAudio: true,
+                        remuxed: false
+                    };
+                }
+
+                const firstMdat = mdatBoxes[0];
+                const lastMdat = mdatBoxes[mdatBoxes.length - 1];
+                // Ensure moov is not sandwiched between multiple mdat boxes
+                if (moovBox.offset > firstMdat.offset && moovBox.end < lastMdat.end) {
+                    const isMov = ftypBrand === 'qt  ';
+                    return {
+                        blob: file,
+                        ext: isMov ? 'mov' : 'mp4',
+                        contentType: isMov ? 'video/quicktime' : 'video/mp4',
+                        hasAudio: true,
+                        remuxed: false
+                    };
+                }
+
+                const moovRaw = new Uint8Array(await file.slice(moovBox.offset, moovBox.end).arrayBuffer());
+                const moovChildren = parseSubBoxesJS(moovRaw, moovBox.hdrSize, moovRaw.byteLength);
+
+                // Inspect all trak boxes to find video and audio tracks
+                const traksInfo = [];
+                for (const ch of moovChildren) {
+                    if (ch.type !== 'trak') continue;
+                    const trakSlice = moovRaw.subarray(ch.start, ch.end);
+                    let handlerType = '';
+                    let sampleEntryType = '';
+                    let hasEsds = false;
+                    const tChildren = parseSubBoxesJS(moovRaw, ch.payloadStart, ch.end);
+                    for (const tc of tChildren) {
+                        if (tc.type === 'mdia') {
+                            const mChildren = parseSubBoxesJS(moovRaw, tc.payloadStart, tc.end);
+                            for (const mc of mChildren) {
+                                if (mc.type === 'hdlr' && (mc.end - mc.payloadStart) >= 12) {
+                                    handlerType = readAscii4(moovRaw, mc.payloadStart + 8);
+                                } else if (mc.type === 'minf') {
+                                    const minfChildren = parseSubBoxesJS(moovRaw, mc.payloadStart, mc.end);
+                                    for (const mic of minfChildren) {
+                                        if (mic.type === 'stbl') {
+                                            const stblChildren = parseSubBoxesJS(moovRaw, mic.payloadStart, mic.end);
+                                            for (const stc of stblChildren) {
+                                                if (stc.type === 'stsd' && (stc.end - stc.payloadStart) >= 16) {
+                                                    sampleEntryType = readAscii4(moovRaw, stc.payloadStart + 12);
+                                                    const stsdEntries = moovRaw.subarray(stc.payloadStart + 8, stc.end);
+                                                    if (findEsdsBoxJS(stsdEntries)) hasEsds = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    traksInfo.push({ box: ch, handlerType, sampleEntryType, hasEsds, trakSlice });
+                }
+
+                const videoTraks = traksInfo.filter(t => t.handlerType === 'vide');
+                const soundTraks = traksInfo.filter(t => t.handlerType === 'soun');
+                const hasMp4aAudio = soundTraks.some(t => t.sampleEntryType === 'mp4a' && t.hasEsds);
+
+                // Choose primary video track + best audio track (prefer mp4a with esds over apac spatial audio)
+                const selectedTraks = [];
+                if (videoTraks.length > 0) selectedTraks.push(videoTraks[0]);
+                if (soundTraks.length > 0) {
+                    const bestAudio = soundTraks.find(t => t.sampleEntryType === 'mp4a' && t.hasEsds)
+                        || soundTraks.find(t => t.sampleEntryType === 'mp4a')
+                        || soundTraks[0];
+                    selectedTraks.push(bestAudio);
+                }
+
+                // If audio track is non-AAC (e.g., lpcm/alac without esds in QuickTime .mov), keep QuickTime container + faststart
+                const canConvertToIsoMp4 = (soundTraks.length === 0) || hasMp4aAudio;
+
+                function convertStsdBox(stsdPayload) {
+                    const header8 = stsdPayload.subarray(0, 8);
+                    const entries = parseSubBoxesJS(stsdPayload, 8, stsdPayload.byteLength);
+                    const outEntries = [];
+                    for (const ent of entries) {
+                        const ep = stsdPayload.subarray(ent.payloadStart, ent.end);
+                        if (ent.type === 'mp4a' && ep.byteLength >= 28) {
+                            const ver = (ep[8] << 8) | ep[9];
+                            if (ver === 1 || ver === 2) {
+                                const esds = findEsdsBoxJS(ep);
+                                if (esds) {
+                                    const newEp = new Uint8Array(28 + esds.byteLength);
+                                    newEp.set(ep.subarray(0, 8), 0); // reserved(6) + data_ref_index(2)
+                                    // version(2)=0, revision(2)=0, vendor(4)=0 -> bytes 8..15 are 0
+                                    if (ver === 1) {
+                                        newEp.set(ep.subarray(16, 20), 16); // channels(2) + samplesize(2)
+                                        newEp.set(ep.subarray(24, 28), 24); // samplerate(4)
+                                    } else if (ver === 2 && ep.byteLength >= 44) {
+                                        const dv = new DataView(ep.buffer, ep.byteOffset, ep.byteLength);
+                                        const sr = Math.round(dv.getFloat64(32, false)) || 44100;
+                                        const ch = Math.min(2, Math.max(1, dv.getUint32(40, false) || 2));
+                                        newEp[16] = 0; newEp[17] = ch;
+                                        newEp[18] = 0; newEp[19] = 16;
+                                        writeU32BE(newEp, 24, (sr << 16) >>> 0);
+                                    }
+                                    newEp.set(esds, 28);
+                                    outEntries.push(makeMp4BoxJS('mp4a', newEp));
+                                    continue;
+                                }
+                            }
+                        }
+                        outEntries.push(stsdPayload.subarray(ent.start, ent.end));
+                    }
+                    return makeMp4BoxJS('stsd', concatUint8Arrays([header8, ...outEntries]));
+                }
+
+                function rebuildTrakBox(trakInfo, newTrackId) {
+                    const chs = parseSubBoxesJS(moovRaw, trakInfo.box.payloadStart, trakInfo.box.end);
+                    const outCh = [];
+                    const isAudio = trakInfo.handlerType === 'soun';
+                    for (const c of chs) {
+                        if (c.type === 'tref' || c.type === 'tapt' || c.type === 'meta') continue;
+                        if (c.type === 'tkhd') {
+                            const tk = new Uint8Array(moovRaw.subarray(c.payloadStart, c.end));
+                            tk[1] = 0; tk[2] = 0; tk[3] = 3; // TrackEnabled | TrackInMovie
+                            const idOff = tk[0] === 1 ? 20 : 12;
+                            if (tk.byteLength >= idOff + 4) writeU32BE(tk, idOff, newTrackId);
+                            if (isAudio) {
+                                const volOff = tk[0] === 1 ? 48 : 36;
+                                if (tk.byteLength >= volOff + 2) {
+                                    tk[volOff] = 1; tk[volOff + 1] = 0; // volume = 1.0 (0x0100)
+                                }
+                            }
+                            outCh.push(makeMp4BoxJS('tkhd', tk));
+                        } else if (c.type === 'mdia') {
+                            const mChs = parseSubBoxesJS(moovRaw, c.payloadStart, c.end);
+                            const mOut = [];
+                            for (const mc of mChs) {
+                                if (mc.type === 'hdlr' && canConvertToIsoMp4) {
+                                    const hd = new Uint8Array(moovRaw.subarray(mc.payloadStart, mc.end));
+                                    if (hd.byteLength >= 24) {
+                                        hd.fill(0, 4, 8);   // pre_defined = 0
+                                        hd.fill(0, 12, 24); // reserved = 0
+                                        const label = new Uint8Array([67, 111, 114, 101, 32, 77, 101, 100, 105, 97, 0]); // "Core Media\0"
+                                        const cleanHd = new Uint8Array(24 + label.byteLength);
+                                        cleanHd.set(hd.subarray(0, 24), 0);
+                                        cleanHd.set(label, 24);
+                                        mOut.push(makeMp4BoxJS('hdlr', cleanHd));
+                                    } else {
+                                        mOut.push(moovRaw.subarray(mc.start, mc.end));
+                                    }
+                                } else if (mc.type === 'minf') {
+                                    const minfChs = parseSubBoxesJS(moovRaw, mc.payloadStart, mc.end);
+                                    const minfOut = [];
+                                    for (const mic of minfChs) {
+                                        if (mic.type === 'hdlr' && canConvertToIsoMp4) continue;
+                                        if (mic.type === 'dinf' && canConvertToIsoMp4) {
+                                            const dinfBytes = new Uint8Array(moovRaw.subarray(mic.payloadStart, mic.end));
+                                            // Replace 'alis' (0x61,0x6c,0x69,0x73) with 'url ' (0x75,0x72,0x6c,0x20)
+                                            for (let k = 0; k + 8 <= dinfBytes.byteLength; k++) {
+                                                if (dinfBytes[k] === 0x61 && dinfBytes[k+1] === 0x6c && dinfBytes[k+2] === 0x69 && dinfBytes[k+3] === 0x73) {
+                                                    dinfBytes[k] = 0x75; dinfBytes[k+1] = 0x72; dinfBytes[k+2] = 0x6c; dinfBytes[k+3] = 0x20;
+                                                }
+                                            }
+                                            minfOut.push(makeMp4BoxJS('dinf', dinfBytes));
+                                        } else if (mic.type === 'stbl') {
+                                            const stblChs = parseSubBoxesJS(moovRaw, mic.payloadStart, mic.end);
+                                            const stblOut = [];
+                                            for (const stc of stblChs) {
+                                                if (stc.type === 'stsd' && canConvertToIsoMp4) {
+                                                    stblOut.push(convertStsdBox(moovRaw.subarray(stc.payloadStart, stc.end)));
+                                                } else if (stc.type === 'cslg' && canConvertToIsoMp4) {
+                                                    continue;
+                                                } else {
+                                                    stblOut.push(moovRaw.subarray(stc.start, stc.end));
+                                                }
+                                            }
+                                            minfOut.push(makeMp4BoxJS('stbl', concatUint8Arrays(stblOut)));
+                                        } else {
+                                            minfOut.push(moovRaw.subarray(mic.start, mic.end));
+                                        }
+                                    }
+                                    mOut.push(makeMp4BoxJS('minf', concatUint8Arrays(minfOut)));
+                                } else {
+                                    mOut.push(moovRaw.subarray(mc.start, mc.end));
+                                }
+                            }
+                            outCh.push(makeMp4BoxJS('mdia', concatUint8Arrays(mOut)));
+                        } else {
+                            outCh.push(moovRaw.subarray(c.start, c.end));
+                        }
+                    }
+                    return makeMp4BoxJS('trak', concatUint8Arrays(outCh));
+                }
+
+                const newMoovParts = [];
+                for (const ch of moovChildren) {
+                    if (ch.type === 'mvhd') {
+                        const mv = new Uint8Array(moovRaw.subarray(ch.payloadStart, ch.end));
+                        if (mv.byteLength >= 4) {
+                            writeU32BE(mv, mv.byteLength - 4, selectedTraks.length + 1);
+                        }
+                        newMoovParts.push(makeMp4BoxJS('mvhd', mv));
+                    }
+                }
+                selectedTraks.forEach((tInfo, idx) => {
+                    newMoovParts.push(rebuildTrakBox(tInfo, idx + 1));
+                });
+
+                const newMoov = makeMp4BoxJS('moov', concatUint8Arrays(newMoovParts));
+                const newFtypPayload = canConvertToIsoMp4
+                    ? new Uint8Array([
+                        0x6d,0x70,0x34,0x32, 0x00,0x00,0x00,0x01, // mp42, v1
+                        0x69,0x73,0x6f,0x6d, 0x6d,0x70,0x34,0x31, 0x6d,0x70,0x34,0x32 // isom, mp41, mp42
+                    ])
+                    : new Uint8Array([
+                        0x71,0x74,0x20,0x20, 0x00,0x00,0x00,0x00, 0x71,0x74,0x20,0x20 // qt  
+                    ]);
+                const newFtyp = makeMp4BoxJS('ftyp', newFtypPayload);
+
+                const oldMdatOffset = firstMdat.offset;
+                const newMdatOffset = newFtyp.byteLength + newMoov.byteLength;
+                const delta = newMdatOffset - oldMdatOffset;
+
+                function patchChunkOffsets(buf, start = 8, end = buf.byteLength) {
+                    const boxes = parseSubBoxesJS(buf, start, end);
+                    for (const b of boxes) {
+                        if (b.type === 'moov' || b.type === 'trak' || b.type === 'mdia' || b.type === 'minf' || b.type === 'stbl') {
+                            patchChunkOffsets(buf, b.payloadStart, b.end);
+                        } else if (b.type === 'stco') {
+                            const cnt = readU32BE(buf, b.payloadStart + 4);
+                            for (let i = 0; i < cnt; i++) {
+                                const off = b.payloadStart + 8 + i * 4;
+                                if (off + 4 <= b.end) {
+                                    const oldVal = readU32BE(buf, off);
+                                    writeU32BE(buf, off, (oldVal + delta) >>> 0);
+                                }
+                            }
+                        } else if (b.type === 'co64') {
+                            const cnt = readU32BE(buf, b.payloadStart + 4);
+                            for (let i = 0; i < cnt; i++) {
+                                const off = b.payloadStart + 8 + i * 8;
+                                if (off + 8 <= b.end) {
+                                    const hi = readU32BE(buf, off);
+                                    const lo = readU32BE(buf, off + 4);
+                                    const nextVal = hi * 4294967296 + lo + delta;
+                                    writeU32BE(buf, off, Math.floor(nextVal / 4294967296) >>> 0);
+                                    writeU32BE(buf, off + 4, (nextVal >>> 0));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                patchChunkOffsets(newMoov, 8, newMoov.byteLength);
+
+                const finalMime = canConvertToIsoMp4 ? 'video/mp4' : 'video/quicktime';
+                const finalExt = canConvertToIsoMp4 ? 'mp4' : 'mov';
+                const remuxedBlob = new Blob(
+                    [newFtyp, newMoov, file.slice(firstMdat.offset, lastMdat.end)],
+                    { type: finalMime }
+                );
+
+                return {
+                    blob: remuxedBlob,
+                    ext: finalExt,
+                    contentType: finalMime,
+                    hasAudio: soundTraks.length > 0,
+                    audioCodec: soundTraks[0]?.sampleEntryType || 'none',
+                    remuxed: true
+                };
+            } catch (err) {
+                console.warn('Video remux fallback:', err);
+                const isMov = /\.mov$/i.test(file.name) || file.type === 'video/quicktime';
+                return {
+                    blob: file,
+                    ext: isMov ? 'mov' : 'mp4',
+                    contentType: isMov ? 'video/quicktime' : 'video/mp4',
+                    hasAudio: true,
+                    remuxed: false
+                };
+            }
+        }
+
+        async function handleMomentFileSelected(ev) {
             const file = ev.target.files && ev.target.files[0];
             if (!file) return;
             selectedMediaFile = file;
@@ -909,6 +1315,8 @@
             const imgEl = document.getElementById('momentPreviewImg');
             const emptyEl = document.getElementById('momentEmptyPlaceholder');
             const infoBadge = document.getElementById('mediaInfoBadge');
+            const audioBadge = document.getElementById('audioStatusBadge');
+            const muteBtn = document.getElementById('btnTogglePreviewMute');
             const objUrl = URL.createObjectURL(file);
             const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
 
@@ -917,9 +1325,23 @@
                 imgEl?.classList.add('hidden');
                 if (vidEl) {
                     vidEl.src = objUrl;
+                    vidEl.muted = false;
+                    vidEl.volume = 1.0;
                     vidEl.classList.remove('hidden');
                     vidEl.currentTime = 0.1;
-                    vidEl.play().catch(() => {});
+                    vidEl.play().then(() => {
+                        if (muteBtn) {
+                            muteBtn.textContent = '🔊 Đang bật tiếng';
+                            muteBtn.classList.remove('hidden');
+                        }
+                    }).catch(() => {
+                        vidEl.muted = true;
+                        vidEl.play().catch(() => {});
+                        if (muteBtn) {
+                            muteBtn.textContent = '🔇 Bấm bật tiếng';
+                            muteBtn.classList.remove('hidden');
+                        }
+                    });
                     vidEl.onloadedmetadata = () => {
                         const dur = vidEl.duration ? vidEl.duration.toFixed(1) + 's' : 'Video';
                         if (infoBadge) {
@@ -928,8 +1350,22 @@
                         }
                     };
                 }
+                if (audioBadge) {
+                    audioBadge.textContent = '🔄 Đang kiểm tra & chuẩn hóa luồng âm thanh Locket...';
+                    audioBadge.classList.remove('hidden');
+                    const inspectRes = await remuxVideoForLocketAudioJS(file);
+                    if (!inspectRes.hasAudio) {
+                        audioBadge.className = 'mt-1.5 px-3.5 py-1.5 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-200 text-[11px] font-bold text-center';
+                        audioBadge.textContent = '⚠️ Video gốc này không có luồng âm thanh (Video câm/Tắt mic)!';
+                    } else {
+                        audioBadge.className = 'mt-1.5 px-3.5 py-1.5 rounded-xl bg-emerald-500/15 border border-emerald-400/40 text-emerald-200 text-[11px] font-bold text-center';
+                        audioBadge.textContent = '🔊 Đã chuẩn hóa AAC FastStart — 100% bạn bè (kể cả không có Gold) đều nghe được tiếng!';
+                    }
+                }
             } else {
                 vidEl?.classList.add('hidden');
+                muteBtn?.classList.add('hidden');
+                audioBadge?.classList.add('hidden');
                 if (imgEl) {
                     imgEl.src = objUrl;
                     imgEl.classList.remove('hidden');
@@ -1129,21 +1565,26 @@
                     }
                 );
 
-                // 3. If video, upload full video to gs://locket-video (no 10s or 15MB check!)
+                // 3. If video, normalize audio/container (ISO MP4 AAC v0 + FastStart) & upload to gs://locket-video
                 let videoUrl = '';
                 if (isVideo) {
-                    const videoPath = `users/${uid}/moments/videos/${momentKey}.mp4`;
-                    const totalMb = (selectedMediaFile.size / (1024 * 1024)).toFixed(1);
+                    if (progLbl) progLbl.textContent = '🔊 Đang chuẩn hóa luồng âm thanh AAC FastStart (để mọi người đều nghe được tiếng)...';
+                    const normVid = await remuxVideoForLocketAudioJS(selectedMediaFile);
+                    const uploadBlob = normVid.blob || selectedMediaFile;
+                    const uploadExt = normVid.ext || 'mp4';
+                    const uploadMime = normVid.contentType || 'video/mp4';
+                    const videoPath = `users/${uid}/moments/videos/${momentKey}.${uploadExt}`;
+                    const totalMb = (uploadBlob.size / (1024 * 1024)).toFixed(1);
                     videoUrl = await uploadBlobToFirebaseStorage(
                         'locket-video',
                         videoPath,
-                        selectedMediaFile,
-                        'video/mp4',
+                        uploadBlob,
+                        uploadMime,
                         idToken,
                         (pct, loaded) => {
                             const mapped = 20 + Math.round(pct * 0.7);
                             const loadedMb = (loaded / (1024 * 1024)).toFixed(1);
-                            if (progLbl) progLbl.textContent = `🚀 Đang tải Video lên Locket Cloud (${loadedMb}MB / ${totalMb}MB)...`;
+                            if (progLbl) progLbl.textContent = `🚀 Đang tải Video có tiếng lên Locket Cloud (${loadedMb}MB / ${totalMb}MB)...`;
                             if (progBar) progBar.style.width = `${mapped}%`;
                             if (progPct) progPct.textContent = `${mapped}%`;
                         }
