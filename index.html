@@ -110,16 +110,10 @@
                 </div>
 
                 <!-- QUICK SELECT ACCOUNTS -->
-                <div class="mt-5 flex flex-wrap items-center gap-2 relative z-10">
+                <div id="quickSelectUsersBar" class="mt-5 flex flex-wrap items-center gap-2 relative z-10">
                     <span class="text-xs font-extrabold text-slate-900">⚡ Chọn nhanh:</span>
                     <button type="button" onclick="quickActivate('hippobbie')" class="px-3.5 py-1.5 rounded-xl bg-slate-950 text-amber-300 hover:bg-slate-800 text-xs font-extrabold shadow-sm transition-all cursor-pointer">
                         👤 @hippobbie
-                    </button>
-                    <button type="button" onclick="quickActivate('dinhvy0801')" class="px-3.5 py-1.5 rounded-xl bg-slate-950 text-amber-300 hover:bg-slate-800 text-xs font-extrabold shadow-sm transition-all cursor-pointer">
-                        👤 @dinhvy0801 (Đinh Vy)
-                    </button>
-                    <button type="button" onclick="quickActivate('tranqvinh')" class="px-3.5 py-1.5 rounded-xl bg-slate-950 text-amber-300 hover:bg-slate-800 text-xs font-extrabold shadow-sm transition-all cursor-pointer">
-                        👤 @tranqvinh (Vinh Trần)
                     </button>
                 </div>
 
@@ -1212,42 +1206,145 @@
             }
         }
 
-        async function loadServerAndUsers() {
-            const pill = document.getElementById('serverIpLabel');
+        function loadSavedUsersFromStorage() {
             try {
-                const res = await fetch('/api/users');
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data && data.ok) {
-                        cloudStatus.cf_url = data.cf_url || cloudStatus.cf_url;
-                        cloudStatus.bore_endpoint = data.bore_endpoint || cloudStatus.bore_endpoint;
-                        if (pill) pill.textContent = `Server Online (${data.bore_endpoint})`;
-                        renderUsersList(data.users || [], false);
-                        return;
-                    }
+                const raw = localStorage.getItem('locket_activated_users_db');
+                if (!raw) return;
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object') {
+                    Object.keys(parsed).forEach(k => {
+                        if (parsed[k] && parsed[k].uid && parsed[k].username) {
+                            KNOWN_USERS_DB[k.toLowerCase()] = parsed[k];
+                        }
+                    });
                 }
             } catch (e) {}
+        }
 
-            // Serverless 24/7 Cloud Mode (GitHub Pages)
+        function saveUserToAllStores(uObj, syncRemote = true) {
+            if (!uObj || !uObj.uid || !uObj.username) return;
+            const key = uObj.username.toLowerCase();
+            const existing = KNOWN_USERS_DB[key] || {};
+            const merged = {
+                uid: uObj.uid,
+                username: uObj.username,
+                full_name: uObj.full_name || existing.full_name || uObj.username,
+                avatar: uObj.avatar || existing.avatar || `https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F${uObj.uid}%2Fpublic%2Fprofile_pic.webp?alt=media`,
+                token: uObj.token || existing.token || uObj.uid.slice(0, 12).toLowerCase(),
+                updated_ms: Date.now()
+            };
+            KNOWN_USERS_DB[key] = merged;
             try {
-                const stRes = await fetch('status.json?t=' + Date.now());
+                localStorage.setItem('locket_activated_users_db', JSON.stringify(KNOWN_USERS_DB));
+            } catch (e) {}
+
+            // Re-render both Quick Select pills & Activated Users list immediately
+            const isCloud = window.location.hostname.includes('github.io');
+            renderUsersList(getSortedUsersList(), isCloud);
+
+            // Sync in background to server DB so all devices receive the new user
+            if (syncRemote && cloudStatus.cf_url) {
+                fetchWithTimeout(`${cloudStatus.cf_url.replace(/\/$/, '')}/api/dns/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: uObj.username })
+                }, 4000).catch(() => {});
+            }
+        }
+
+        function getSortedUsersList() {
+            return Object.values(KNOWN_USERS_DB).sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0));
+        }
+
+        async function loadServerAndUsers() {
+            loadSavedUsersFromStorage();
+            const pill = document.getElementById('serverIpLabel');
+            let isCloud = window.location.hostname.includes('github.io');
+
+            if (!isCloud) {
+                try {
+                    const res = await fetchWithTimeout('/api/users', {}, 3000);
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data && data.ok) {
+                            cloudStatus.cf_url = data.cf_url || cloudStatus.cf_url;
+                            cloudStatus.bore_endpoint = data.bore_endpoint || cloudStatus.bore_endpoint;
+                            if (Array.isArray(data.users)) {
+                                data.users.forEach(u => {
+                                    if (u && u.username) {
+                                        const k = u.username.toLowerCase();
+                                        KNOWN_USERS_DB[k] = { ...(KNOWN_USERS_DB[k] || {}), ...u };
+                                    }
+                                });
+                            }
+                            try {
+                                localStorage.setItem('locket_activated_users_db', JSON.stringify(KNOWN_USERS_DB));
+                            } catch (e) {}
+                            if (pill) pill.textContent = `Server Online (${data.bore_endpoint})`;
+                            renderUsersList(getSortedUsersList(), false);
+                            return;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // Serverless 24/7 Cloud Mode (GitHub Pages): merge status.json + live tunnel /api/users + localStorage
+            try {
+                const stRes = await fetchWithTimeout('status.json?t=' + Date.now(), {}, 3500);
                 if (stRes.ok) {
                     const st = await stRes.json();
                     if (st.cf_url) cloudStatus.cf_url = st.cf_url;
                     if (st.bore_endpoint) cloudStatus.bore_endpoint = st.bore_endpoint;
                     if (Array.isArray(st.users)) {
                         st.users.forEach(u => {
-                            if (u.username) KNOWN_USERS_DB[u.username.toLowerCase()] = u;
+                            if (u && u.username) {
+                                const k = u.username.toLowerCase();
+                                KNOWN_USERS_DB[k] = { ...(KNOWN_USERS_DB[k] || {}), ...u };
+                            }
                         });
                     }
                 }
             } catch (e) {}
 
+            if (cloudStatus.cf_url) {
+                try {
+                    const r2 = await fetchWithTimeout(`${cloudStatus.cf_url.replace(/\/$/, '')}/api/users`, {}, 3500);
+                    if (r2.ok) {
+                        const d2 = await r2.json();
+                        if (d2 && Array.isArray(d2.users)) {
+                            d2.users.forEach(u => {
+                                if (u && u.username) {
+                                    const k = u.username.toLowerCase();
+                                    KNOWN_USERS_DB[k] = { ...(KNOWN_USERS_DB[k] || {}), ...u };
+                                }
+                            });
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            try {
+                localStorage.setItem('locket_activated_users_db', JSON.stringify(KNOWN_USERS_DB));
+            } catch (e) {}
+
             if (pill) pill.textContent = `Cloud 24/7 Online (${cloudStatus.bore_endpoint})`;
-            renderUsersList(Object.values(KNOWN_USERS_DB), true);
+            renderUsersList(getSortedUsersList(), true);
         }
 
         function renderUsersList(users, isCloudMode) {
+            // 1. Update Quick Select Bar at the top
+            const quickBar = document.getElementById('quickSelectUsersBar');
+            if (quickBar) {
+                const pillsHtml = users.map(u => {
+                    const label = (u.full_name && u.full_name.toLowerCase() !== u.username.toLowerCase())
+                        ? `@${u.username} (${u.full_name})`
+                        : `@${u.username}`;
+                    return `<button type="button" onclick="quickActivate('${u.username.replace(/'/g, "\\'")}')" class="px-3.5 py-1.5 rounded-xl bg-slate-950 text-amber-300 hover:bg-slate-800 text-xs font-extrabold shadow-sm transition-all cursor-pointer">👤 ${label}</button>`;
+                }).join('');
+                quickBar.innerHTML = `<span class="text-xs font-extrabold text-slate-900">⚡ Chọn nhanh (${users.length}):</span>` + pillsHtml;
+            }
+
+            // 2. Update Activated Users List at the bottom
             const box = document.getElementById('activatedUsersList');
             if (!box) return;
             box.innerHTML = users.map(u => {
@@ -1482,7 +1579,7 @@
                             </div>
                         `;
                     }
-                    loadServerAndUsers();
+                    saveUserToAllStores(data, true);
                     setTimeout(() => { if (btnText) btnText.textContent = '⚡ Kiểm Tra & Kích Hoạt VIP'; }, 2500);
                 } else {
                     if (btnText) btnText.textContent = '⚡ Kiểm Tra & Kích Hoạt VIP';
