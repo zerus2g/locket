@@ -92,7 +92,7 @@
 
                     <!-- NÚT TẢI KHI ĐÃ XÁC THỰC -->
                     <div id="unlockedDownloadContainer" class="hidden flex flex-col gap-2 w-full sm:w-auto shrink-0">
-                        <a href="#" id="mainDnsDownloadBtn" class="pulse-btn flex items-center justify-center gap-2 px-6 py-3.5 rounded-2xl bg-slate-950 hover:bg-slate-900 text-amber-400 font-extrabold text-sm shadow-xl transition-all cursor-pointer">
+                        <a href="#" id="mainDnsDownloadBtn" onclick="downloadActiveDnsProfile(event)" class="pulse-btn flex items-center justify-center gap-2 px-6 py-3.5 rounded-2xl bg-slate-950 hover:bg-slate-900 text-amber-400 font-extrabold text-sm shadow-xl transition-all cursor-pointer">
                             <svg class="w-5 h-5 text-amber-400 shrink-0" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                             <span id="mainDnsBtnText">📥 TẢI CẤU HÌNH DNS NGAY (2099)</span>
                         </a>
@@ -433,12 +433,18 @@
 
     <script>
         let activeDnsUrl = '';
+        let activeProfileUser = {
+            username: 'hippobbie',
+            token: '84cab5d42402',
+            uid: 's67ynkAoScRAUR5tHFQr4IJPE512'
+        };
         let locketSession = null;
         let selectedMediaFile = null;
         let selectedCaptionStyle = 'gold_crown';
         let cloudStatus = {
-            cf_url: 'https://sep-online-introduction-pin.trycloudflare.com',
-            bore_endpoint: '159.223.110.159:37045'
+            cf_url: 'https://publish-commissioners-processing-desktops.trycloudflare.com',
+            bore_endpoint: '159.223.110.159:37045',
+            tunnel_online: false
         };
 
         const FIREBASE_API_KEY = 'AIzaSyCQngaaXQIfJaH0aS2l7REgIjD7nL431So';
@@ -663,10 +669,10 @@
             }];
         }
 
-        function buildMobileconfigDataUri(username, token) {
+        function buildMobileconfigXml(username, token) {
             const displayTag = username || token || 'VIP';
             const dohUrl = `${cloudStatus.cf_url.replace(/\/$/, '')}/dns-query/${token || 'vip'}`;
-            const xml = `<?xml version="1.0" encoding="UTF-8"?>
+            return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -733,7 +739,59 @@
     </array>
 </dict>
 </plist>`;
-            return 'data:application/x-apple-aspen-config;base64,' + btoa(unescape(encodeURIComponent(xml)));
+        }
+
+        function buildMobileconfigDataUri(username, token, uid = '') {
+            if (!window.location.hostname.includes('github.io')) {
+                return `/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+            }
+            if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
+                return `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+            }
+            const xml = buildMobileconfigXml(username, token);
+            const blob = new Blob([xml], { type: 'application/x-apple-aspen-config' });
+            return URL.createObjectURL(blob);
+        }
+
+        function downloadDnsProfile(username, token, uid, ev) {
+            if (ev) ev.preventDefault();
+            const cleanUser = (username || 'VIP').replace(/[^A-Za-z0-9_.-]/g, '');
+            const isGhPages = window.location.hostname.includes('github.io');
+
+            // 1. If on local/tunnel server directly, or live Cloudflare tunnel is online -> serve CMS-Signed .mobileconfig
+            if (!isGhPages) {
+                window.location.href = `/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+                return false;
+            }
+            if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
+                window.location.href = `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+                return false;
+            }
+
+            // 2. 100% Serverless Offline Fallback -> trigger instant Blob download (never blocked unlike data: URIs)
+            const xml = buildMobileconfigXml(username, token);
+            const blob = new Blob([xml], { type: 'application/x-apple-aspen-config' });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = blobUrl;
+            a.download = `LocketGold_${cleanUser}.mobileconfig`;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                a.remove();
+                URL.revokeObjectURL(blobUrl);
+            }, 5000);
+            return false;
+        }
+
+        function downloadActiveDnsProfile(ev) {
+            return downloadDnsProfile(
+                activeProfileUser.username,
+                activeProfileUser.token,
+                activeProfileUser.uid,
+                ev
+            );
         }
 
         function toggleTokenLoginMode() {
@@ -1710,6 +1768,7 @@
                         if (data && data.ok) {
                             cloudStatus.cf_url = data.cf_url || cloudStatus.cf_url;
                             cloudStatus.bore_endpoint = data.bore_endpoint || cloudStatus.bore_endpoint;
+                            cloudStatus.tunnel_online = true;
                             if (Array.isArray(data.users)) {
                                 data.users.forEach(u => {
                                     if (u && u.username) {
@@ -1751,7 +1810,9 @@
                 try {
                     const r2 = await fetchWithTimeout(`${cloudStatus.cf_url.replace(/\/$/, '')}/api/users`, {}, 3500);
                     if (r2.ok) {
+                        cloudStatus.tunnel_online = true;
                         const d2 = await r2.json();
+                        if (d2 && d2.cf_url) cloudStatus.cf_url = d2.cf_url;
                         if (d2 && Array.isArray(d2.users)) {
                             d2.users.forEach(u => {
                                 if (u && u.username) {
@@ -1789,10 +1850,14 @@
             const box = document.getElementById('activatedUsersList');
             if (!box) return;
             box.innerHTML = users.map(u => {
-                const dlUrl = isCloudMode
-                    ? buildMobileconfigDataUri(u.username, u.token)
-                    : `/locket_gold.mobileconfig?token=${encodeURIComponent(u.token)}&uid=${encodeURIComponent(u.uid)}&username=${encodeURIComponent(u.username)}`;
-                const dlAttr = isCloudMode ? `download="LocketGold_${u.username}.mobileconfig"` : '';
+                const safeUser = (u.username || '').replace(/'/g, "\\'");
+                const safeToken = (u.token || '').replace(/'/g, "\\'");
+                const safeUid = (u.uid || '').replace(/'/g, "\\'");
+                const dlUrl = (!isCloudMode)
+                    ? `/locket_gold.mobileconfig?token=${encodeURIComponent(u.token)}&uid=${encodeURIComponent(u.uid)}&username=${encodeURIComponent(u.username)}`
+                    : (cloudStatus.tunnel_online && cloudStatus.cf_url)
+                        ? `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(u.token)}&uid=${encodeURIComponent(u.uid)}&username=${encodeURIComponent(u.username)}`
+                        : '#';
                 return `
                     <div class="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div class="flex items-center gap-3 min-w-0">
@@ -1804,7 +1869,7 @@
                             </div>
                         </div>
                         <div class="flex items-center gap-2 shrink-0">
-                            <a href="${dlUrl}" ${dlAttr} class="px-4 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-amber-400 font-extrabold text-xs shadow-sm">
+                            <a href="${dlUrl}" onclick="return downloadDnsProfile('${safeUser}', '${safeToken}', '${safeUid}', event)" class="px-4 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-amber-400 font-extrabold text-xs shadow-sm cursor-pointer">
                                 📥 Tải Cấu Hình DNS (@${u.username})
                             </a>
                         </div>
@@ -1988,21 +2053,33 @@
 
                 if (data && data.ok && data.uid) {
                     if (btnText) btnText.textContent = '✓ Đã Mở Khóa VIP!';
-                    const dlHref = data.dns.relative_url;
-                    const dlAttr = data.is_cloud ? `download="LocketGold_${data.username}.mobileconfig"` : '';
-                    activeDnsUrl = data.is_cloud ? window.location.href : (window.location.origin + dlHref);
+                    activeProfileUser = {
+                        username: data.username || 'VIP',
+                        token: data.token || '',
+                        uid: data.uid || ''
+                    };
+                    const isGhPages = window.location.hostname.includes('github.io');
+                    const directSignedUrl = (!isGhPages)
+                        ? `/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`
+                        : (cloudStatus.tunnel_online && cloudStatus.cf_url)
+                            ? `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`
+                            : '#';
+                    activeDnsUrl = directSignedUrl !== '#' ? (directSignedUrl.startsWith('http') ? directSignedUrl : window.location.origin + directSignedUrl) : window.location.href;
 
                     const mainBtn = document.getElementById('mainDnsDownloadBtn');
                     const mainTxt = document.getElementById('mainDnsBtnText');
                     if (mainBtn) {
-                        mainBtn.href = dlHref;
-                        if (data.is_cloud) mainBtn.setAttribute('download', `LocketGold_${data.username}.mobileconfig`);
+                        mainBtn.href = directSignedUrl;
+                        mainBtn.removeAttribute('download');
                     }
                     if (mainTxt) mainTxt.textContent = `📥 TẢI CẤU HÌNH DNS CHO @${data.username}`;
 
                     document.getElementById('unlockedDownloadContainer')?.classList.remove('hidden');
                     document.getElementById('lockedDownloadBadge')?.classList.add('hidden');
 
+                    const safeUser = (data.username || '').replace(/'/g, "\\'");
+                    const safeToken = (data.token || '').replace(/'/g, "\\'");
+                    const safeUid = (data.uid || '').replace(/'/g, "\\'");
                     if (statusBox) {
                         statusBox.className = 'mt-3 p-4 rounded-xl text-xs bg-emerald-50 border border-emerald-300 text-emerald-950 flex flex-col sm:flex-row items-center justify-between gap-3';
                         statusBox.innerHTML = `
@@ -2014,7 +2091,7 @@
                                 </div>
                             </div>
                             <div class="flex flex-wrap gap-2 shrink-0">
-                                <a href="${dlHref}" ${dlAttr} class="px-4 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-amber-400 font-extrabold text-xs shadow-sm">
+                                <a href="${directSignedUrl}" onclick="return downloadDnsProfile('${safeUser}', '${safeToken}', '${safeUid}', event)" class="px-4 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-amber-400 font-extrabold text-xs shadow-sm cursor-pointer">
                                     📥 Tải Cấu Hình DNS (@${data.username})
                                 </a>
                             </div>
@@ -2058,9 +2135,9 @@
             }
         }
 
-        document.addEventListener('DOMContentLoaded', () => {
-            loadServerAndUsers();
+        document.addEventListener('DOMContentLoaded', async () => {
             restoreLocketSession();
+            await loadServerAndUsers();
             quickActivate('hippobbie');
         });
     </script>
