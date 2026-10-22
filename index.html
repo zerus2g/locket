@@ -519,21 +519,43 @@
         }
 
         async function refreshLocketTokenDirect(refreshToken) {
-            const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken })
-            });
-            const data = await res.json();
-            if (res.ok && data.id_token) {
-                return {
-                    ok: true,
-                    id_token: data.id_token,
-                    refresh_token: data.refresh_token || refreshToken,
-                    uid: data.user_id || decodeJwtPayload(data.id_token).user_id || ''
-                };
-            }
-            return { ok: false, error: (data.error && data.error.message) || 'Refresh token hết hạn' };
+            const base = (window.location.protocol === 'file:') ? 'http://127.0.0.1' : '';
+            try {
+                const res = await fetch(`${base}/api/locket/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ refresh_token: refreshToken })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.ok && data.id_token) {
+                        return {
+                            ok: true,
+                            id_token: data.id_token,
+                            refresh_token: data.refresh_token || refreshToken,
+                            uid: data.uid || decodeJwtPayload(data.id_token).user_id || ''
+                        };
+                    }
+                }
+            } catch (e) {}
+
+            try {
+                const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken })
+                });
+                const data = await res.json();
+                if (res.ok && data.id_token) {
+                    return {
+                        ok: true,
+                        id_token: data.id_token,
+                        refresh_token: data.refresh_token || refreshToken,
+                        uid: data.user_id || decodeJwtPayload(data.id_token).user_id || ''
+                    };
+                }
+            } catch (e) {}
+            return { ok: false, error: 'Không thể làm mới phiên đăng nhập.' };
         }
 
         async function locketLoginDirect({ identifier = '', password = '', refresh_token = '', id_token = '' }) {
@@ -559,6 +581,29 @@
                 if (!ident || !password) {
                     return { ok: false, error: 'Vui lòng nhập Email / Số điện thoại và Mật khẩu Locket!' };
                 }
+
+                // 1. Try local or cloud backend proxy (bypasses Google API Key iOS Bundle ID restriction)
+                const proxyBases = [
+                    (window.location.protocol === 'file:') ? 'http://127.0.0.1' : '',
+                    (window.location.protocol === 'file:') ? 'http://127.0.0.1:8080' : '',
+                    cloudStatus.cf_url ? cloudStatus.cf_url.replace(/\/$/, '') : ''
+                ];
+                for (const base of proxyBases) {
+                    if (base === '' && window.location.protocol === 'file:') continue;
+                    try {
+                        const pr = await fetchWithTimeout(`${base}/api/locket/login`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ identifier: ident, password })
+                        }, 5000);
+                        if (pr.ok) {
+                            const pd = await pr.json();
+                            if (pd && pd.ok && pd.id_token) return pd;
+                            if (pd && pd.error) return pd;
+                        }
+                    } catch (e) {}
+                }
+
                 if (ident.includes('@')) {
                     const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`, {
                         method: 'POST',
@@ -572,6 +617,8 @@
                             msg = 'Sai mật khẩu Locket! Vui lòng kiểm tra lại.';
                         } else if (msg.includes('EMAIL_NOT_FOUND')) {
                             msg = 'Không tìm thấy tài khoản với Email này (hãy thử đăng nhập bằng Số điện thoại).';
+                        } else if (msg.includes('blocked') || msg.includes('empty')) {
+                            msg = 'Google chặn đăng nhập trực tiếp từ trình duyệt! Hãy mở qua http://localhost (sau khi chạy start.bat) hoặc đăng nhập bằng Refresh Token.';
                         }
                         return { ok: false, error: msg };
                     }
@@ -742,6 +789,15 @@
         }
 
         function buildMobileconfigDataUri(username, token, uid = '') {
+            const isLocalFile = window.location.protocol === 'file:';
+            if (isLocalFile) {
+                if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
+                    return `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+                }
+                const xml = buildMobileconfigXml(username, token);
+                const blob = new Blob([xml], { type: 'application/x-apple-aspen-config' });
+                return URL.createObjectURL(blob);
+            }
             if (!window.location.hostname.includes('github.io')) {
                 return `/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
             }
@@ -756,19 +812,45 @@
         function downloadDnsProfile(username, token, uid, ev) {
             if (ev) ev.preventDefault();
             const cleanUser = (username || 'VIP').replace(/[^A-Za-z0-9_.-]/g, '');
+            const isLocalFile = window.location.protocol === 'file:';
             const isGhPages = window.location.hostname.includes('github.io');
 
-            // 1. If on local/tunnel server directly, or live Cloudflare tunnel is online -> serve CMS-Signed .mobileconfig
+            // 1. If running directly via file:// protocol
+            if (isLocalFile) {
+                if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
+                    window.location.href = `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
+                    return false;
+                }
+                // Instant client-side Blob download (prevents file:///C:/locket_gold.mobileconfig ERR_FILE_NOT_FOUND)
+                const xml = buildMobileconfigXml(username, token);
+                const blob = new Blob([xml], { type: 'application/x-apple-aspen-config' });
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = blobUrl;
+                a.download = `LocketGold_${cleanUser}.mobileconfig`;
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => {
+                    a.remove();
+                    URL.revokeObjectURL(blobUrl);
+                }, 5000);
+                return false;
+            }
+
+            // 2. If on local server (http://localhost or http://192.168.x.x)
             if (!isGhPages) {
                 window.location.href = `/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
                 return false;
             }
+
+            // 3. If on GitHub Pages with live tunnel
             if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
                 window.location.href = `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(token || '')}&uid=${encodeURIComponent(uid || '')}&username=${encodeURIComponent(username || '')}`;
                 return false;
             }
 
-            // 2. 100% Serverless Offline Fallback -> trigger instant Blob download (never blocked unlike data: URIs)
+            // 4. Serverless Fallback
             const xml = buildMobileconfigXml(username, token);
             const blob = new Blob([xml], { type: 'application/x-apple-aspen-config' });
             const blobUrl = URL.createObjectURL(blob);
@@ -1524,7 +1606,8 @@
 
         function uploadViaServerFallback(bucket, objectName, blob, contentType, idToken, onProgress) {
             return new Promise((resolve, reject) => {
-                const url = `/api/locket/upload-storage?bucket=${encodeURIComponent(bucket)}&name=${encodeURIComponent(objectName)}`;
+                const base = (window.location.protocol === 'file:') ? 'http://127.0.0.1' : '';
+                const url = `${base}/api/locket/upload-storage?bucket=${encodeURIComponent(bucket)}&name=${encodeURIComponent(objectName)}`;
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', url, true);
                 xhr.setRequestHeader('X-Locket-Token', idToken);
@@ -1672,14 +1755,41 @@
                 if (captionVal) momentData.caption = captionVal;
                 if (overlays.length > 0) momentData.overlays = overlays;
 
-                const directPostRes = await fetch('https://api.locketcamera.com/postMomentV2', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${idToken}`
-                    },
-                    body: JSON.stringify({ data: momentData })
-                });
+                let directPostRes;
+                try {
+                    directPostRes = await fetch('https://api.locketcamera.com/postMomentV2', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${idToken}`
+                        },
+                        body: JSON.stringify({ data: momentData })
+                    });
+                } catch (e) {
+                    const base = (window.location.protocol === 'file:') ? 'http://127.0.0.1' : '';
+                    directPostRes = await fetch(`${base}/api/locket/post-moment`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Locket-Token': idToken
+                        },
+                        body: JSON.stringify({ data: momentData })
+                    });
+                }
+
+                if (!directPostRes.ok) {
+                    const base = (window.location.protocol === 'file:') ? 'http://127.0.0.1' : '';
+                    try {
+                        directPostRes = await fetch(`${base}/api/locket/post-moment`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Locket-Token': idToken
+                            },
+                            body: JSON.stringify({ data: momentData })
+                        });
+                    } catch (e) {}
+                }
 
                 if (directPostRes.ok) {
                     if (progBar) progBar.style.width = '100%';
@@ -2058,19 +2168,27 @@
                         token: data.token || '',
                         uid: data.uid || ''
                     };
+                    const isLocalFile = window.location.protocol === 'file:';
                     const isGhPages = window.location.hostname.includes('github.io');
-                    const directSignedUrl = (!isGhPages)
-                        ? `/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`
-                        : (cloudStatus.tunnel_online && cloudStatus.cf_url)
+                    let directSignedUrl = '#';
+
+                    if (isLocalFile) {
+                        directSignedUrl = (cloudStatus.tunnel_online && cloudStatus.cf_url)
                             ? `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`
-                            : '#';
-                    activeDnsUrl = directSignedUrl !== '#' ? (directSignedUrl.startsWith('http') ? directSignedUrl : window.location.origin + directSignedUrl) : window.location.href;
+                            : `http://127.0.0.1/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`;
+                    } else if (!isGhPages) {
+                        directSignedUrl = `/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`;
+                    } else if (cloudStatus.tunnel_online && cloudStatus.cf_url) {
+                        directSignedUrl = `${cloudStatus.cf_url.replace(/\/$/, '')}/locket_gold.mobileconfig?token=${encodeURIComponent(data.token)}&uid=${encodeURIComponent(data.uid)}&username=${encodeURIComponent(data.username)}`;
+                    }
+                    activeDnsUrl = directSignedUrl !== '#' ? directSignedUrl : window.location.href;
 
                     const mainBtn = document.getElementById('mainDnsDownloadBtn');
                     const mainTxt = document.getElementById('mainDnsBtnText');
                     if (mainBtn) {
                         mainBtn.href = directSignedUrl;
                         mainBtn.removeAttribute('download');
+                        mainBtn.onclick = (e) => downloadDnsProfile(data.username, data.token, data.uid, e);
                     }
                     if (mainTxt) mainTxt.textContent = `📥 TẢI CẤU HÌNH DNS CHO @${data.username}`;
 

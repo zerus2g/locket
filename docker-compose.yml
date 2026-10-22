@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  locket-gold-server:
+    build: .
+    container_name: locket-gold-server
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./status.json:/app/status.json
+      - ./certs:/app/certs
